@@ -163,6 +163,84 @@ chown -R deploy:deploy /usr/share/nginx/html/specs
 
 -----
 
+## ブラウザUI仕様
+
+### セレクトボックス検索機能
+
+セレクトボックスに検索機能を追加するため、**choices.js** を導入する。
+
+|項目    |内容                                       |
+|------|-----------------------------------------|
+|ライブラリ |choices.js                               |
+|読み込み方式|CDN優先・失敗時はローカルファイルにフォールバック（ReDoc.jsと同じ方式）|
+|検索対象  |ブランチ選択・リビジョン選択の両方                        |
+
+#### select2 vs choices.js 選定理由
+
+|項目     |select2           |choices.js |
+|-------|------------------|-----------|
+|依存     |jQuery必要          |**依存なし**   |
+|CDN提供  |✅                 |✅          |
+|オフライン対応|jQueryも別途ローカル配置が必要|**1ファイルのみ**|
+|軽量さ    |やや重い              |**軽量**     |
+
+現行構成がjQuery非使用のシンプルなHTMLのため、choices.jsを採用。
+
+### ローカルファイルの配置（オフライン対応）
+
+```bash
+# JS
+curl -o /usr/share/nginx/html/choices.min.js \
+  https://cdn.jsdelivr.net/npm/choices.js/public/assets/scripts/choices.min.js
+
+# CSS
+curl -o /usr/share/nginx/html/choices.min.css \
+  https://cdn.jsdelivr.net/npm/choices.js/public/assets/styles/choices.min.css
+```
+
+### index.html への組み込み
+
+```html
+<!-- choices.js CSS -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/choices.js/public/assets/styles/choices.min.css"
+  onerror="this.href='/choices.min.css'">
+
+<!-- choices.js JS -->
+<script src="https://cdn.jsdelivr.net/npm/choices.js/public/assets/scripts/choices.min.js"
+  onerror="this.src='/choices.min.js'"></script>
+```
+
+```javascript
+// ブランチ選択
+new Choices('#branch-select', {
+  searchEnabled: true,
+  searchPlaceholderValue: 'ブランチを検索...',
+  itemSelectText: '',
+});
+
+// リビジョン選択
+new Choices('#revision-select', {
+  searchEnabled: true,
+  searchPlaceholderValue: 'リビジョンを検索...',
+  itemSelectText: '',
+});
+```
+
+### UI表示イメージ
+
+```
+[ ブランチ ]
+┌─────────────────────────┐
+│ 🔍 ブランチを検索...     │
+├─────────────────────────┤
+│ main                    │
+│ release-v2              │
+│ release-v1              │
+└─────────────────────────┘
+```
+
+-----
+
 ## generate.sh との比較
 
 |項目           |generate.sh（現行）  |GitLab CI（新方式）|
