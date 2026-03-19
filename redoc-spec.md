@@ -3,7 +3,7 @@
 ## システム全体構成
 
 ```
-[GitLab]                    [Dockerコンテナ]                 [ホストマシン/Nginx]            [ブラウザ]
+[GitLab]                    [ホストマシン]                   [Nginx]                        [ブラウザ]
 ブランチ一覧取得  →  パターンマッチ → yaml取得(HTTP)  →  output/specs/ に配置  →  ReDoc.js でレンダリング
 ```
 
@@ -13,18 +13,15 @@
 
 ```
 redoc-gen/                          # 生成スクリプト一式
-├── generate.sh                     # 実行エントリポイント
-├── docker-compose.yml
+├── generate.sh                     # 実行スクリプト（処理本体を含む）
 ├── .env                            # git管理外
-├── .env.example
-└── docker/
-    ├── Dockerfile
-    └── entrypoint.sh
+└── .env.example
 
 /usr/share/nginx/html/              # Nginxドキュメントルート
 ├── index.html                      # ブラウザUI
 ├── redoc.standalone.js             # オフライン用ローカルJS
 └── specs/                          # OUTPUT_DIRの出力先
+    ├── .hash_cache                 # ブランチごとの最新ハッシュ（git管理外）
     ├── main/
     │   ├── 2024-03-19-001/
     │   │   └── openapi.yaml
@@ -49,18 +46,39 @@ redoc-gen/                          # 生成スクリプト一式
 |ブランチ一覧取得|GitLab API (`/repository/branches?per_page=100&page=N`)|
 |yaml取得  |GitLab API (`/repository/files/:path/raw?ref=:branch`) |
 |認証      |アクセストークン（`PRIVATE-TOKEN` ヘッダー）                         |
-|DNS解決   |コンテナ内 `/etc/hosts` にGitLabのIP/ホスト名を追記                  |
+|DNS解決   |ホストマシン側で解決済み（`/etc/hosts` 追記・社内DNS等）                   |
 
 -----
 
-## Dockerコンテナ仕様
+## スクリプト仕様
 
-|項目           |内容                                         |
-|-------------|-------------------------------------------|
-|ベースイメージ      |`alpine:3.19`                              |
-|インストールパッケージ  |`curl` `ca-certificates` `jq`              |
-|redoclyインストール|不要（レンダリングはブラウザ側のReDoc.jsが担う）               |
-|処理内容         |DNS設定 → GitLab疎通確認 → yaml取得 → ホストマシンにマウント出力|
+|項目   |内容                                  |
+|-----|------------------------------------|
+|実行環境 |ホストマシン（bash）                        |
+|依存ツール|`curl`・`jq`                         |
+|処理内容 |GitLab疎通確認 → yaml取得 → ハッシュ比較 → 採番・配置|
+
+### 前提条件
+
+ホストマシンに以下が入っていること。
+
+```bash
+curl --version
+jq --version
+```
+
+### generate.sh 処理フロー
+
+```
+1. .env を読み込む
+2. GitLabへの疎通確認
+3. GitLab APIでブランチ一覧をページネーション付きで全件取得
+4. BRANCH_PATTERNS にマッチするブランチを抽出（左から評価・先勝ち）
+5. 各ブランチのyamlをHTTP取得
+6. output/.hash_cache と比較して変更がなければスキップ（ログに記録）
+7. 変更があればリビジョンを採番（YYYY-MM-DD-NNN）して output/specs/ に配置
+8. .hash_cache を更新
+```
 
 -----
 
@@ -69,16 +87,16 @@ redoc-gen/                          # 生成スクリプト一式
 ```bash
 GITLAB_HOST=gitlab.example.com      # スキームなしのホスト名（HTTP接続）
 GITLAB_TOKEN=glpat-xxxxxxxxxxxx     # アクセストークン（read_repository権限）
-GITLAB_IP=192.168.1.100             # GitLabサーバーのIPアドレス
 GITLAB_PROJECT_ID=123               # GitLabのプロジェクトID
 YAML_PATH=docs/openapi.yaml         # リポジトリ内のyamlファイルパス
 
 # 正規表現パターン（スペース区切りで複数指定）
 # 形式: "正規表現パターン:ラベル生成ルール"
+# 評価順: 左から順に評価し、最初にマッチしたパターンを使用（先勝ち）
 # __branch__ を指定するとブランチ名から自動生成（/ → - に変換）
 BRANCH_PATTERNS="^main$:main ^release/.*:__branch__"
 
-OUTPUT_DIR=./output                 # ホストマシンの出力先
+OUTPUT_DIR=./output                 # ホストマシンの出力先（Nginxドキュメントルートにマウント）
 ```
 
 ### パターン指定例
@@ -107,13 +125,31 @@ feature/xyz  →  feature-xyz
 
 -----
 
-## リビジョン命名規則
+## リビジョン採番仕様
 
 ```
 YYYY-MM-DD-NNN
 
 例: 2024-03-19-001       # その日の1回目
     2024-03-19-002       # 同日2回目（連番インクリメント）
+```
+
+### 採番条件
+
+- yamlのハッシュ値（MD5またはSHA256）を `output/.hash_cache` に保存
+- 前回取得分と比較し、変更があった場合のみ新リビジョンを採番
+- 変更なしの場合はスキップし、ログに以下を記録
+
+```
+[SKIP] main: no changes detected (hash matched)
+```
+
+### .hash_cache フォーマット（TSV）
+
+```
+main	a3f8c2d1e4b7...
+release-v2	9c1d4e7f2a3b...
+feature-xyz	5b8e1c4d9f2a...
 ```
 
 -----
@@ -171,7 +207,7 @@ curl -o /usr/share/nginx/html/redoc.standalone.js \
 ./generate.sh
 # → GitLab APIでブランチ一覧取得
 # → BRANCH_PATTERNSにマッチしたブランチのyamlを取得
-# → リビジョンを自動採番してNginxに即反映
+# → ハッシュ比較で変更があったブランチのみリビジョンを採番してNginxに即反映
 
 # ブランチ追加時
 # .env の BRANCH_PATTERNS が既存パターンにマッチすれば何もしない
