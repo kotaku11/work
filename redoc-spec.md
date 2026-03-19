@@ -21,7 +21,7 @@ redoc-gen/                          # 生成スクリプト一式
 ├── index.html                      # ブラウザUI
 ├── redoc.standalone.js             # オフライン用ローカルJS
 └── specs/                          # OUTPUT_DIRの出力先
-    ├── .hash_cache                 # ブランチごとの最新ハッシュ（git管理外）
+    ├── .hash_cache                 # ブランチごとの最新ハッシュ（git管理外・OUTPUT_DIR/specs/.hash_cache がマウント後にここに対応）
     ├── main/
     │   ├── 2024-03-19-001/
     │   │   └── openapi.yaml
