@@ -190,7 +190,7 @@ VM-A/VM-Bとは別の監視専用VM(またはは既存管理サーバー)に設�
 ### 方針
 
 - **ツール**: Trivy (コンテナイメージ、OS、アプリケーション依存関係の脆弱性スキャン)
-- **実行環境**: 監視専用VM(第5章参照)で集中管理
+- **実行環境**: 監視専用VM(第5章参照)で集中管理。ただし、実際のスキャン処理自体は各スキャン対象VM上で実行し(下記参照)、監視専用VMはSSH経由での実行指示と結果収集を担う
 - **スキャン対象**: コンテナイメージ、稼働系/待機系 OS、アプリケーション依存関係
 - **実行頻度**: 日次(夜間 02:00、dump/restore処理と前後しない時間帯)
 
@@ -201,16 +201,9 @@ VM-A/VM-Bとは別の監視専用VM(またはは既存管理サーバー)に設�
 - 既存の Uptime Kuma 監視体系と統合容易
 - 開発環境規模に対して運用負荷が軽い
 
-### 【検証反映】前提構成:Trivyのインストール先
+### 前提構成:Trivyのインストール先
 
-当初設計では監視専用VMにのみTrivyを導入する想定だったが、AWS検証環境(Ubuntu 24.04 ×2台)での疎通確認の結果、以下の理由から**スキャン対象VM側にもTrivyのインストールが必須**であることが判明した。
-
-| 項目 | 修正前(設計時点) | 修正後(検証反映) |
-|------|------------------|------------------|
-| Trivy導入先 | 監視専用VMのみ | 監視専用VM + 各スキャン対象VM(VM-A/VM-B) |
-| 実行方式 | 監視専用VM上でローカル実行を想定した記述(`trivy image openproject:latest`) | `ssh <対象VM> "trivy image ..."` の形でリモート実行 |
-
-**理由**: `trivy image`はDockerデーモンへのアクセスが必須であり、`trivy filesystem`は対象ホストのファイルシステムに直接アクセスする必要があるため、いずれもスキャン処理自体は**対象VM上で実行**される。監視専用VMはSSH経由でコマンドを送り、結果(JSON)を受け取る役割に限定される。
+`trivy image`はDockerデーモンへのアクセスが必須であり、`trivy filesystem`は対象ホストのファイルシステムに直接アクセスする必要があるため、いずれもスキャン処理自体は**対象VM上で実行**する。したがって、**Trivyは監視専用VMだけでなく、各スキャン対象VM(VM-A/VM-B)にもインストールする**。監視専用VMは、SSH経由でスキャン対象VM上のTrivyを実行し、結果(JSON)を受け取る役割を担う。
 
 ### スキャン対象と優先度
 
@@ -222,9 +215,9 @@ VM-A/VM-Bとは別の監視専用VM(またはは既存管理サーバー)に設�
 | 🟠 中 | VM-A OS(Ubuntu) | 本体 OS 脆弱性 | Filesystem スキャン |
 | 🟡 低 | VM-B OS(Ubuntu) | 待機系(起動優先度低) | Filesystem スキャン(週1回) |
 
-### 【検証反映】事前準備:スキャン対象VMのディスク容量
+### 事前準備:スキャン対象VMのディスク容量
 
-Trivyは初回実行時に以下のデータをダウンロードするため、スキャン対象VM側に十分な空き容量を確保する必要がある。
+Trivyは初回実行時に以下のデータをダウンロードするため、スキャン対象VM側に十分な空き容量を確保する。
 
 | データ | サイズ目安 |
 |--------|-----------|
@@ -232,18 +225,16 @@ Trivyは初回実行時に以下のデータをダウンロードするため、
 | Java依存関係DB(trivy-java-db) | 約400〜600MB |
 | Dockerイメージ本体 | 対象イメージによる |
 
-検証中、EBSボリューム(8GB)の空き容量が3GB程度あったにもかかわらず、Java DBのダウンロードで `no space left on device` エラーが発生するケースがあった。原因の切り分けとして以下を推奨する。
+事前に `df -h` および `df -i`(inode使用率)を確認しておく。Javaアプリケーションを含まない対象(OSスキャンのみ等)では、以下のオプションでJava DBダウンロードをスキップし、容量・速度の両面で負荷を下げる。
 
-- 事前に `df -h` および `df -i`(inode使用率)を確認しておく
-- Javaアプリケーションを含まない対象(OSスキャンのみ等)では、以下のオプションでJava DBダウンロードをスキップし、容量・速度の両面で負荷を下げられる
-  ```bash
-  --pkg-types os          # OSパッケージのみ対象、言語別DB(Java等)は不要に
-  --scanners vuln         # 脆弱性検出のみ(Secret/Misconfigurationスキャンを除外、高速化)
-  ```
+```bash
+--pkg-types os          # OSパッケージのみ対象、言語別DB(Java等)は不要に
+--scanners vuln         # 脆弱性検出のみ(Secret/Misconfigurationスキャンを除外、高速化)
+```
 
-### 【検証反映】OSスキャン実行時の注意(Secret scanningによる長時間化)
+### OSスキャン実行時の注意
 
-`trivy filesystem /` はデフォルトで Secret scanning(全ファイルの中身をパターンマッチで走査)も有効なため、ルートファイルシステム全体が対象だと処理に時間がかかる(検証環境で数分〜)。運用スクリプトでは `--scanners vuln` を明示指定し、脆弱性検出のみに絞ることで大幅な高速化が可能。
+`trivy filesystem /` はデフォルトで Secret scanning(全ファイルの中身をパターンマッチで走査)も有効なため、ルートファイルシステム全体が対象だと処理に時間がかかる。運用スクリプトでは `--scanners vuln` を明示指定し、脆弱性検出のみに絞ることで高速化する。
 
 ### スクリプト配置と実行
 
@@ -264,9 +255,9 @@ Trivyは初回実行時に以下のデータをダウンロードするため、
     └── baseline-severity.txt
 ```
 
-#### 【検証反映】所有者・権限
+#### 所有者・権限
 
-検証を踏まえ、以下の権限設定を推奨する。スキャン結果JSONには対象システムの脆弱性情報(攻撃者にとって有用な情報)が含まれるため、他ユーザーからの読み取りを制限する。
+スキャン結果JSONには対象システムの脆弱性情報(攻撃者にとって有用な情報)が含まれるため、他ユーザーからの読み取りを制限する。
 
 ```bash
 sudo mkdir -p /opt/monitoring/trivy/{reports,baseline}
@@ -287,14 +278,13 @@ sudo chmod 640 /opt/monitoring/trivy/reports/*.json
 0 2 * * * /opt/monitoring/trivy/vulnerability-scan.sh >> /var/log/trivy-scan.log 2>&1
 ```
 
-#### 【検証反映】vulnerability-scan.sh の概要(リモート実行版に修正)
+#### vulnerability-scan.sh の概要
 
 ```bash
 #!/bin/bash
 
-# 監視対象のコンテナイメージ、OS のスキャン
+# 監視対象のコンテナイメージ、OS のスキャン(SSH経由でスキャン対象VM上のTrivyをリモート実行)
 # 前回比較で新規/増加脆弱性を検知
-# ※スキャン対象VM側にもTrivyインストールが必須(検証で判明)
 
 # 1. コンテナイメージスキャン(VM-A上でリモート実行)
 ssh vm-a "trivy image openproject:latest --severity HIGH,CRITICAL --format json --skip-version-check" \
@@ -307,12 +297,11 @@ ssh vm-a "trivy image nexus:latest --severity HIGH,CRITICAL --format json --skip
   > /opt/monitoring/trivy/reports/nexus-image.json
 
 # 2. OS(ファイルシステム)スキャン(VM-A/VM-Bへリモート実行)
-# --scanners vuln で Secret scanning を除外し高速化(検証で長時間化を確認)
+# --scanners vuln で Secret scanning を除外し高速化
 ssh vm-a "trivy filesystem / --severity HIGH,CRITICAL --format json --skip-version-check --scanners vuln" \
   > /opt/monitoring/trivy/reports/vm-a-fs.json
 
-# 3. 脆弱性カウント集計
-# ※ jq -s (スラープ)で複数JSONファイルを安全に結合する形に修正
+# 3. 脆弱性カウント集計(jq -s でスラープし、複数JSONファイルを安全に結合)
 CRITICAL_COUNT=$(jq -s '[.[].Results[].Vulnerabilities[]?] | map(select(.Severity=="CRITICAL")) | length' \
   /opt/monitoring/trivy/reports/*.json)
 
@@ -357,12 +346,6 @@ if [ "$STATUS" = "down" ]; then
 fi
 ```
 
-**修正点(検証反映)**:
-1. `trivy image` / `trivy filesystem` を `ssh <対象VM> "..."` によるリモート実行形式に統一
-2. `--skip-version-check` を付与(バージョン確認通知の抑制)
-3. OSスキャンに `--scanners vuln` を付与(Secret scanningを除外し高速化)
-4. 集計処理を `cat *.json | jq` から `jq -s`(スラープ)方式に変更し、複数JSONファイルの結合を安全に処理
-
 ### Trivy 設定ファイル(trivy-config.yaml)
 
 ```yaml
@@ -401,9 +384,9 @@ debug: false
 2. **HIGH 脆弱性**: 週内対応(スプリント内で修正)
 3. **MEDIUM 以下**: 月1回の定期レビュー
 
-#### 【検証反映】FixedVersionの有無による仕分けを追加
+#### FixedVersionの有無による仕分け
 
-検証の結果、CRITICAL/HIGHの件数だけでは対応の緊急性を正しく判断できないことが判明した。同じSeverityでも「パッチ適用で解消可能なもの」と「上流で未修正のもの」が混在するため、以下の仕分けを対応フローに追加する。
+CRITICAL/HIGHの件数だけでは対応の緊急性を正しく判断できない。同じSeverityでも「パッチ適用で解消可能なもの」と「上流で未修正のもの」が混在するため、以下の仕分けを対応フローに組み込む。
 
 ```bash
 # パッチ適用可能 / 未対応の仕分け
@@ -418,13 +401,11 @@ jq '[.Results[].Vulnerabilities[] | select(.Severity=="CRITICAL")] |
 | FixedVersionあり | パッチ適用(apt upgrade等)で解消可能 → 即日対応 |
 | FixedVersionなし | 上流未対応 → リスク承認 → スキップリスト登録し、定期的に再確認 |
 
-検証環境(Ubuntu 24.04)では、CRITICAL 71件中5件が上流未修正(主にカーネルサブシステム関連の最近のCVE)であり、これらはパッチ適用では解消できず、影響機能(未使用ドライバ・サブシステム等)を確認した上でリスク許容する運用が妥当と判断された。
+### 古いカーネルパッケージの取り扱い
 
-#### 【検証反映】古いカーネルパッケージの取り扱い
+`apt upgrade` および再起動を実施しても、直前バージョンのカーネル関連パッケージ(`linux-image`, `linux-headers`, `linux-modules`, `linux-tools` 等)が `apt autoremove` で自動削除されず、Trivyの脆弱性検出に残り続けるケースがある。AWS(linux-aws系)カーネルパッケージは自動削除対象としてマークされない場合があり、Ubuntu標準カーネルより発生しやすい。
 
-検証中、`apt upgrade` および再起動を実施しても、直前バージョンのカーネル関連パッケージ(`linux-image`, `linux-headers`, `linux-modules`, `linux-tools` 等)が `apt autoremove` で自動削除されず、Trivyの脆弱性検出に残り続けるケースを確認した。これはAWS(linux-aws系)カーネルパッケージが自動削除対象としてマークされない場合があるための挙動であり、Ubuntu標準カーネルより発生しやすい。
-
-**推奨運用**:
+**運用ルール**:
 - カーネル更新・再起動後、新カーネルの安定稼働を確認したうえで、明示的に旧カーネル関連パッケージを `apt purge` する運用手順を定期メンテナンスに組み込む
   ```bash
   # 例:現在のカーネルバージョンを確認した上で、旧バージョンの関連パッケージを個別に指定してpurge
@@ -444,7 +425,7 @@ CRITICAL/HIGH 脆弱性 検出?
   │         ↓
   │         Slack 通知(セキュリティ/DevOps)
   │         ↓
-  │         FixedVersion 有無を確認 【検証反映で追加】
+  │         FixedVersion 有無を確認
   │         ├─ 有 → パッチ適用 → イメージ/OS 更新 → 再スキャン
   │         └─ 無 → リスク承認 → チケット化 → スキップリスト登録
   │
@@ -474,19 +455,8 @@ CRITICAL/HIGH 脆弱性 検出?
 - [ ] 脆弱性スキップリスト(false positive 対応)の管理ポリシー
 - [ ] CI/CD パイプライン(GitHub Actions等)への統合
 - [ ] より詳細なレポート生成(HTML形式で月次レビュー用)
-- [ ] 【検証反映】旧カーネルパッケージの定期クリーンアップ手順の自動化検討
-- [ ] 【検証反映】監視専用VM・スキャン対象VM双方のTrivyバージョン統一/更新管理手順の整備
-
-### 【検証反映】付録:AWS検証環境での疎通確認結果サマリー
-
-| 確認項目 | 結果 |
-|----------|------|
-| 監視専用VM → スキャン対象VM のSSH疎通 | ✅ 正常動作 |
-| スキャン対象VM上のDocker権限(SSH非対話実行) | ✅ dockerグループ追加で解決 |
-| コンテナイメージスキャン(`trivy image`)のリモート実行 | ✅ 正常動作(要:対象VM側にもTrivy導入) |
-| OS/ファイルシステムスキャン(`trivy filesystem`)のリモート実行 | ✅ 正常動作(`--scanners vuln`推奨) |
-| jqによる集計(Severity別、FixedVersion有無別) | ✅ 正常動作 |
-| 基準値比較の仕組み(パッチ適用前後での差分検知) | ✅ 実データで動作確認(CRITICAL 71→60→5の推移を確認) |
+- [ ] 旧カーネルパッケージの定期クリーンアップ手順の自動化検討
+- [ ] 監視専用VM・スキャン対象VM双方のTrivyバージョン統一/更新管理手順の整備
 
 ## 7. マルウェア対策設計(Microsoft Defender for Endpoint / mdatp)
 
@@ -632,8 +602,8 @@ fi
 - [ ] Trivy 脆弱性DBの定期更新スケジュール確定
 - [ ] 脆弱性スキップリスト(false positive対応)のレビュー・管理ポリシー決定
 - [ ] CI/CD パイプラインへの Trivy 統合
-- [ ] 【検証反映】旧カーネルパッケージの定期クリーンアップ手順の自動化検討
-- [ ] 【検証反映】監視専用VM・スキャン対象VM双方のTrivyバージョン統一/更新管理手順の整備
+- [ ] 旧カーネルパッケージの定期クリーンアップ手順の自動化検討
+- [ ] 監視専用VM・スキャン対象VM双方のTrivyバージョン統一/更新管理手順の整備
 - [ ] mdatp のスキャン除外設定・パフォーマンス影響評価
 - [ ] mdatp と Trivy のアラートを統合したダッシュボード化
 - [ ] mdatp 検出時のインシデント対応Runbook策定
