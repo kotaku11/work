@@ -140,6 +140,7 @@ PostgreSQLを使用
 | dump/転送/リストアジョブ | Push監視(heartbeat) |
 | サーバーリソース(CPU/MEM/DISK) | Push監視のping値 |
 | 脆弱性スキャン | Push監視(heartbeat) |
+| マルウェア検知(mdatp) | Push監視(heartbeat、リアルタイム監視は常駐のためPush対象外) |
 
 #### dump/転送/リストアジョブの監視
 
@@ -171,6 +172,8 @@ PostgreSQLを使用
 [VM-A][Growi] CPU / MEM / DISK
 [VM-A][Nexus] CPU / MEM / DISK  等
 [監視サーバ][Trivy] Vulnerability Scan
+[VM-A][mdatp] Malware Scan
+[VM-B][mdatp] Malware Scan
 ```
 
 ### アラート通知先
@@ -384,7 +387,140 @@ CRITICAL/HIGH 脆弱性 検出?
 - [ ] CI/CD パイプライン(GitHub Actions等)への統合
 - [ ] より詳細なレポート生成(HTML形式で月次レビュー用)
 
-## 7. データ保全(誤操作対策・異常検知)
+## 7. マルウェア対策設計(Microsoft Defender for Endpoint / mdatp)
+
+### 方針
+
+- **ツール**: Microsoft Defender for Endpoint on Linux(パッケージ名 `mdatp`)
+- **対象OS**: Ubuntu 24.04 LTS(VM-A / VM-B)
+- **役割**: Trivyが担う「脆弱性(CVE)スキャン」とは明確に分離し、mdatpは「マルウェア/ウイルスの検出・駆除」を担当
+- **管理**: Microsoft Defenderポータル(M365 Defender Premium)でのクラウド一元管理
+
+### Trivyとの役割分担
+
+| ツール | 役割 | 検出対象 | 実行環境 |
+|--------|------|---------|---------|
+| Trivy | 脆弱性(CVE)スキャン | コンテナイメージ/OS/依存関係の既知脆弱性 | 監視専用VM(集中管理) |
+| mdatp | マルウェア/ウイルス検出 | 侵入したマルウェア・不審なファイル操作 | VM-A / VM-B 各ホスト常駐 |
+
+→ 両者は競合せず補完関係(Trivyは「弱点の有無」、mdatpは「実際の攻撃・感染の有無」を監視)
+
+### 監視方式
+
+#### ① リアルタイム監視(常時)
+
+- ファイルの作成・変更・実行等を常時監視し、侵入・感染を即時検知
+- systemdで常駐プロセスとして稼働(`mdatp` サービス)
+
+#### ② スケジュール型スキャン(日次)
+
+- 毎日 **02:30** にフルスキャンを実行
+- Trivy(02:00)・dump/転送/リストア処理と時間帯が重ならないよう調整
+  - 02:00 Trivy 脆弱性スキャン
+  - 02:30 mdatp フルスキャン
+  - (dump/リストア処理は別時間帯で運用)
+
+### M365 Defender Premiumとの統合
+
+- 各VMをMicrosoft Defenderポータルにオンボーディングし、以下をクラウド側で一元管理
+  - エージェントの稼働状況・シグネチャ更新状態
+  - 検出インシデントの履歴・詳細調査
+  - ポリシー(スキャン設定・除外設定等)の配布
+- インシデント発生時はポータル上でのトリアージを一次窓口とし、Uptime Kuma/Slackは「気づき(一次アラート)」を担う位置づけ
+
+### Uptime Kumaとの連携
+
+- スケジュール型スキャン(日次02:30)の実行結果をPush通知
+  - 成功時: `status=up`
+  - マルウェア検出時: `status=down` + 検出内容をmsgに含めてSlackにも連携(Trivyと同様のパターン)
+- エージェント自体の異常(プロセス停止、シグネチャ未更新等)もPush監視の対象とし、mdatpが停止した場合に気づけるようにする(常駐プロセスの死活は別途heartbeatで補足)
+
+### 実装ステップ
+
+1. **インストール**
+   - Microsoft公式リポジトリを追加
+   - `apt-get install mdatp`
+2. **オンボーディング**
+   - Microsoft Defenderポータルで発行されるオンボーディングスクリプト(`MicrosoftDefenderATPOnboardingLinuxServer.py`等)を実行し、テナントに登録
+3. **リアルタイム監視の有効化**
+   ```bash
+   mdatp config real-time-protection --value enabled
+   ```
+4. **スケジュールスキャンの設定**
+   - cronで日次02:30にフルスキャンを実行
+   ```bash
+   # 毎日 02:30 に mdatp フルスキャンを実行
+   30 2 * * * /opt/monitoring/mdatp/malware-scan.sh >> /var/log/mdatp-scan.log 2>&1
+   ```
+5. **Uptime Kuma統合**
+   - スキャン完了後にPush URLへ結果を送信
+
+### スクリプト配置と実行(案)
+
+#### ディレクトリ構成
+
+```
+/opt/monitoring/mdatp/
+├── malware-scan.sh        # スケジュールスキャン実行・結果通知スクリプト
+└── logs/                  # スキャン結果ログ(簡易保管)
+```
+
+#### malware-scan.sh の概要
+
+```bash
+#!/bin/bash
+
+# 1. フルスキャン実行(結果はmdatpのログ/ポータル側に集約される)
+mdatp scan full
+
+# 2. スキャン結果(脅威検出有無)を取得
+THREATS=$(mdatp threat list --output json | jq '. | length')
+
+# 3. 結果に応じてUptime Kumaへ通知
+KUMA_URL="http://uptime-kuma:3001/api/push/mdatp-scan"
+HOSTNAME=$(hostname)
+
+if [ "$THREATS" -gt 0 ]; then
+  STATUS="down"
+  MSG="[mdatp Alert] $HOSTNAME: 脅威検出 $THREATS 件"
+else
+  STATUS="up"
+  MSG="[mdatp OK] $HOSTNAME: 脅威検出なし"
+fi
+
+curl -X POST "$KUMA_URL?status=$STATUS&msg=$MSG&ping=$(date +%s)"
+
+# 4. 脅威検出時はSlackにも通知
+if [ "$STATUS" = "down" ]; then
+  SLACK_WEBHOOK_URL="https://hooks.slack.com/services/..."
+  curl -X POST -H 'Content-type: application/json' \
+    --data "{\"text\":\"🦠 mdatpマルウェア検出アラート: $MSG\"}" \
+    "$SLACK_WEBHOOK_URL"
+fi
+```
+
+### 検出できる脅威 / できないもの
+
+#### ✅ 検出できるもの
+
+- 既知のマルウェア・ウイルス(シグネチャ/クラウドベース検知)
+- 不審なファイル操作・実行(リアルタイム監視)
+- 一部の未知の脅威(クラウド保護・ヒューリスティック検知)
+
+#### ❌ 検出できないもの
+
+- コンテナイメージ/OS/依存関係の既知脆弱性(CVE) → Trivyの担当領域
+- アプリケーション側のロジック不備(SQLインジェクション等)
+- 認可ロジックの不備、SCP/SSH認証情報の設定ミス
+
+### 将来の拡張(保留事項)
+
+- [ ] スキャン除外設定(パフォーマンスに影響しうるディレクトリの除外要否の検討)
+- [ ] リアルタイム監視によるI/O負荷の実測・影響評価
+- [ ] mdatpとTrivyのアラートをUptime Kuma上で集約ダッシュボード化
+- [ ] インシデント対応Runbook(mdatp検出時の一次対応・エスカレーション先)の文書化
+
+## 8. データ保全(誤操作対策・異常検知)
 
 ### 背景
 
@@ -425,7 +561,7 @@ CRITICAL/HIGH 脆弱性 検出?
 - リソースに余裕ができた場合の複数世代保持
 - 物理的に別拠点でのオフサイト保管
 
-## 8. 未決定・今後の検討事項
+## 9. 未決定・今後の検討事項
 
 - [ ] Runbook(障害検知 ~ DNS担当連絡 ~ 切替 ~ 復旧)の文書化
 - [ ] 閾値超過時のリソースアラート実装(CPU/MEM/DISK)
@@ -435,3 +571,6 @@ CRITICAL/HIGH 脆弱性 検出?
 - [ ] Trivy 脆弱性DBの定期更新スケジュール確定
 - [ ] 脆弱性スキップリスト(false positive対応)のレビュー・管理ポリシー決定
 - [ ] CI/CD パイプラインへの Trivy 統合
+- [ ] mdatp のスキャン除外設定・パフォーマンス影響評価
+- [ ] mdatp と Trivy のアラートを統合したダッシュボード化
+- [ ] mdatp 検出時のインシデント対応Runbook策定
