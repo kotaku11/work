@@ -45,7 +45,7 @@
 
 ### VM-A(稼働系)のフロー
 
-1. サニティチェック(6章参照)
+1. サニティチェック(7章参照)
 2. DBダンプ / ファイルアーカイブ作成
 3. 直近1世代のみ保持(世代管理は最小限、リソース制約のため)
 4. SCPで待機系(VM-B)へ転送
@@ -139,6 +139,7 @@ PostgreSQLを使用
 | 待機系DB(ポート) | TCP監視 |
 | dump/転送/リストアジョブ | Push監視(heartbeat) |
 | サーバーリソース(CPU/MEM/DISK) | Push監視のping値 |
+| 脆弱性スキャン | Push監視(heartbeat) |
 
 #### dump/転送/リストアジョブの監視
 
@@ -169,6 +170,7 @@ PostgreSQLを使用
 [VM-B][OpenProject-Standby] CPU / MEM / DISK
 [VM-A][Growi] CPU / MEM / DISK
 [VM-A][Nexus] CPU / MEM / DISK  等
+[監視サーバ][Trivy] Vulnerability Scan
 ```
 
 ### アラート通知先
@@ -181,7 +183,208 @@ PostgreSQLを使用
 VM-A/VM-Bとは別の監視専用VM(またはは既存管理サーバー)に設置
 - 稼働系障害時に監視も道連れにならないようにするため
 
-## 6. データ保全(誤操作対策・異常検知)
+## 6. 脆弱性点検設計(Trivy)
+
+### 方針
+
+- **ツール**: Trivy (コンテナイメージ、OS、アプリケーション依存関係の脆弱性スキャン)
+- **実行環境**: 監視専用VM(第5章参照)で集中管理
+- **スキャン対象**: コンテナイメージ、稼働系/待機系 OS、アプリケーション依存関係
+- **実行頻度**: 日次(夜間 02:00、dump/restore処理と前後しない時間帯)
+
+### 採用理由
+
+- Docker Compose 環境に最適化されている
+- 複数のスキャン対象(イメージ/OS/依存関係)を1ツールでカバー可能
+- 既存の Uptime Kuma 監視体系と統合容易
+- 開発環境規模に対して運用負荷が軽い
+
+### スキャン対象と優先度
+
+| 優先度 | 対象 | 理由 | スキャン対象 |
+|--------|------|------|------------|
+| 🔴 高 | OpenProject(VM-A) | 重要データ保有(プロジェクト) | コンテナイメージ + OS |
+| 🔴 高 | Growi(VM-A) | 重要データ保有(wiki) | コンテナイメージ + OS |
+| 🟠 中 | Nexus(VM-A) | アーティファクト保管 | コンテナイメージ + OS |
+| 🟠 中 | VM-A OS(Ubuntu) | 本体 OS 脆弱性 | Filesystem スキャン |
+| 🟡 低 | VM-B OS(Ubuntu) | 待機系(起動優先度低) | Filesystem スキャン(週1回) |
+
+### スクリプト配置と実行
+
+#### ディレクトリ構成
+
+```
+/opt/monitoring/trivy/
+├── vulnerability-scan.sh    # 主スクリプト
+├── trivy-config.yaml        # Trivy設定ファイル
+├── reports/                 # スキャン結果レポート保管
+│   ├── openproject-image.json
+│   ├── openproject-os.json
+│   ├── growi-image.json
+│   ├── growi-os.json
+│   ├── nexus-image.json
+│   └── vm-a-fs.json
+└── baseline/                # 基準値管理(脆弱性数の前回値)
+    └── baseline-severity.txt
+```
+
+#### cron 設定(監視専用VM)
+
+```bash
+# 毎日 02:00 に脆弱性スキャン実行
+0 2 * * * /opt/monitoring/trivy/vulnerability-scan.sh >> /var/log/trivy-scan.log 2>&1
+```
+
+#### vulnerability-scan.sh の概要
+
+```bash
+#!/bin/bash
+
+# 監視対象のコンテナイメージ、OS のスキャン
+# 前回比較で新規/増加脆弱性を検知
+
+# 1. コンテナイメージスキャン(VM-AのDocker環境へリモート実行)
+trivy image openproject:latest --severity HIGH,CRITICAL --format json \
+  > /opt/monitoring/trivy/reports/openproject-image.json
+
+trivy image growi:latest --severity HIGH,CRITICAL --format json \
+  > /opt/monitoring/trivy/reports/growi-image.json
+
+trivy image nexus:latest --severity HIGH,CRITICAL --format json \
+  > /opt/monitoring/trivy/reports/nexus-image.json
+
+# 2. OS(ファイルシステム)スキャン(VM-A/VM-Bへリモート実行)
+# SSH経由でマウントまたはローカルスキャン
+ssh vm-a "trivy filesystem /" --severity HIGH,CRITICAL --format json \
+  > /opt/monitoring/trivy/reports/vm-a-fs.json
+
+# 3. 脆弱性カウント集計
+CRITICAL_COUNT=$(cat /opt/monitoring/trivy/reports/*.json | \
+  jq '[.Results[].Misconfigurations[]?, .Results[].Vulnerabilities[]?] | \
+      map(select(.Severity=="CRITICAL")) | length' | xargs echo | awk '{s+=$1} END {print s}')
+
+HIGH_COUNT=$(cat /opt/monitoring/trivy/reports/*.json | \
+  jq '[.Results[].Misconfigurations[]?, .Results[].Vulnerabilities[]?] | \
+      map(select(.Severity=="HIGH")) | length' | xargs echo | awk '{s+=$1} END {print s}')
+
+# 4. 基準値との比較(初回実行時は基準値設定、以降は前回値と比較)
+if [ -f /opt/monitoring/trivy/baseline/baseline-severity.txt ]; then
+  PREV_CRITICAL=$(grep "CRITICAL" /opt/monitoring/trivy/baseline/baseline-severity.txt | awk '{print $2}')
+  PREV_HIGH=$(grep "HIGH" /opt/monitoring/trivy/baseline/baseline-severity.txt | awk '{print $2}')
+  
+  # 新規脆弱性 or 増加検知時は異常判定
+  if [ "$CRITICAL_COUNT" -gt "$PREV_CRITICAL" ] || [ "$HIGH_COUNT" -gt "$PREV_HIGH" ]; then
+    STATUS="down"
+    MSG="[Trivy Alert] CRITICAL: $CRITICAL_COUNT(prev:$PREV_CRITICAL) HIGH: $HIGH_COUNT(prev:$PREV_HIGH)"
+  else
+    STATUS="up"
+    MSG="[Trivy OK] CRITICAL: $CRITICAL_COUNT HIGH: $HIGH_COUNT"
+  fi
+else
+  # 初回実行: 基準値設定
+  STATUS="up"
+  MSG="[Trivy Baseline] CRITICAL: $CRITICAL_COUNT HIGH: $HIGH_COUNT (初回実行)"
+fi
+
+# 5. 基準値更新
+cat > /opt/monitoring/trivy/baseline/baseline-severity.txt << EOF
+CRITICAL $CRITICAL_COUNT
+HIGH $HIGH_COUNT
+EOF
+
+# 6. Uptime Kuma へ Push 通知
+KUMA_URL="http://uptime-kuma:3001/api/push/trivy-scan"
+curl -X POST "$KUMA_URL?status=$STATUS&msg=$MSG&ping=$(date +%s)"
+
+# 7. 高リスク脆弱性検知時、Slack へも通知(オプション)
+if [ "$STATUS" = "down" ]; then
+  SLACK_WEBHOOK_URL="https://hooks.slack.com/services/..."
+  curl -X POST -H 'Content-type: application/json' \
+    --data "{\"text\":\"⚠️ Trivy脆弱性アラート: $MSG\"}" \
+    "$SLACK_WEBHOOK_URL"
+fi
+```
+
+### Trivy 設定ファイル(trivy-config.yaml)
+
+```yaml
+severity:
+  - HIGH
+  - CRITICAL
+
+# スキャン対象(デフォルト)
+scanners:
+  - vuln        # 脆弱性スキャン
+  - misconfig   # 設定ファイル問題
+
+# DBキャッシュ(オプション)
+cache:
+  dir: /opt/monitoring/trivy/.trivy-cache
+
+# レポート形式
+format: json
+
+# 出力詳細度
+debug: false
+```
+
+### レポート保管と分析
+
+#### レポートの管理
+
+- **保管先**: `/opt/monitoring/trivy/reports/`
+- **保管期間**: 90日(Trivy スキャン結果の傾向分析用)
+- **命名規則**: `{service-name}-{scan-type}-{YYYY-MM-DD}.json`
+  - 例: `openproject-image-2026-01-15.json`
+
+#### 分析と対応
+
+1. **CRITICAL 脆弱性**: 即日対応(パッチ適用またはリスク承認)
+2. **HIGH 脆弱性**: 週内対応(スプリント内で修正)
+3. **MEDIUM 以下**: 月1回の定期レビュー
+
+### 脆弱性への対応フロー
+
+```
+Trivy スキャン実行(日次 02:00)
+  ↓
+CRITICAL/HIGH 脆弱性 検出?
+  ├─ YES → Uptime Kuma: status=down
+  │         ↓
+  │         Slack 通知(セキュリティ/DevOps)
+  │         ↓
+  │         対応判断
+  │         ├─ パッチ適用 → イメージ/OS 更新 → 再スキャン
+  │         └─ リスク承認 → チケット化 → スキップリスト登録
+  │
+  └─ NO → Uptime Kuma: status=up (正常)
+          基準値更新
+```
+
+### 検出できる脆弱性 / できない脅威
+
+#### ✅ 検出できるもの
+
+- コンテナベースイメージの既知脆弱性(CVE)
+- OS パッケージ(apt, yum等)の脆弱性
+- Python, Node.js, Java 等アプリ依存パッケージの脆弱性
+- Docker/Kubernetes 設定ミス
+
+#### ❌ 検出できないもの
+
+- ロジック的な脆弱性(SQLインジェクション等)
+- ゼロデイ脆弱性(未公開 CVE)
+- SCP/SSH 認証情報漏洩の設定ミス(現状 command= 制限なし)
+- アプリケーション側の認可ロジックの不備
+
+### 将来の拡張(保留事項)
+
+- [ ] Trivy の脆弱性DBを定期更新(毎日 03:00 実行)
+- [ ] 脆弱性スキップリスト(false positive 対応)の管理ポリシー
+- [ ] CI/CD パイプライン(GitHub Actions等)への統合
+- [ ] より詳細なレポート生成(HTML形式で月次レビュー用)
+
+## 7. データ保全(誤操作対策・異常検知)
 
 ### 背景
 
@@ -222,10 +425,13 @@ VM-A/VM-Bとは別の監視専用VM(またはは既存管理サーバー)に設�
 - リソースに余裕ができた場合の複数世代保持
 - 物理的に別拠点でのオフサイト保管
 
-## 7. 未決定・今後の検討事項
+## 8. 未決定・今後の検討事項
 
 - [ ] Runbook(障害検知 ~ DNS担当連絡 ~ 切替 ~ 復旧)の文書化
 - [ ] 閾値超過時のリソースアラート実装(CPU/MEM/DISK)
 - [ ] SCP/SSH用ユーザーのセキュリティ強化(command=制限、ラッパースクリプト等)
 - [ ] DBネイティブなストリーミングレプリケーション/レプリカセット方式への移行(将来のRPO短縮)
 - [ ] サニティチェックの閾値(現在10%想定)の運用調整
+- [ ] Trivy 脆弱性DBの定期更新スケジュール確定
+- [ ] 脆弱性スキップリスト(false positive対応)のレビュー・管理ポリシー決定
+- [ ] CI/CD パイプラインへの Trivy 統合
